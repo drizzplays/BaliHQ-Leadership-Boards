@@ -550,8 +550,7 @@ client.on('interactionCreate', async (interaction) => {
           `Stored win/loss reactions: **${stats.reactionCount}**`,
           `Stored reactor-point reactions: **${stats.pointReactionCount}**`,
           `Allowed play sources: **${config.requireWebhook ? 'webhook only, plus bot/app alerts if enabled' : 'webhook + bot/app alerts'}**`
-        ].join('
-'))
+        ].join('\n'))
         .setTimestamp(new Date());
       await interaction.editReply({ embeds: [embed] });
       return;

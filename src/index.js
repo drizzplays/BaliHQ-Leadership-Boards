@@ -4,10 +4,18 @@ const {
   Partials,
   EmbedBuilder,
   PermissionFlagsBits,
-  MessageFlags
+  MessageFlags,
+  AttachmentBuilder
 } = require('discord.js');
 const { config } = require('./config');
 const { Store } = require('./store');
+
+let createCanvas = null;
+try {
+  ({ createCanvas } = require('@napi-rs/canvas'));
+} catch (error) {
+  console.warn('Leaderboard image renderer unavailable:', error.message);
+}
 
 const store = new Store(config.dataFile);
 
@@ -501,6 +509,238 @@ async function resolveDisplayName(userId, guild = null) {
   return cleaned;
 }
 
+
+function escapeHtml(value) {
+  return String(value || '')
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;');
+}
+
+function trimText(ctx, text, maxWidth) {
+  const value = String(text || '');
+  if (ctx.measureText(value).width <= maxWidth) return value;
+  let trimmed = value;
+  while (trimmed.length > 1 && ctx.measureText(`${trimmed}…`).width > maxWidth) {
+    trimmed = trimmed.slice(0, -1);
+  }
+  return `${trimmed}…`;
+}
+
+function roundedRect(ctx, x, y, width, height, radius, fillStyle, strokeStyle = null, lineWidth = 1) {
+  const r = Math.min(radius, width / 2, height / 2);
+  ctx.beginPath();
+  ctx.moveTo(x + r, y);
+  ctx.arcTo(x + width, y, x + width, y + height, r);
+  ctx.arcTo(x + width, y + height, x, y + height, r);
+  ctx.arcTo(x, y + height, x, y, r);
+  ctx.arcTo(x, y, x + width, y, r);
+  ctx.closePath();
+  if (fillStyle) {
+    ctx.fillStyle = fillStyle;
+    ctx.fill();
+  }
+  if (strokeStyle) {
+    ctx.strokeStyle = strokeStyle;
+    ctx.lineWidth = lineWidth;
+    ctx.stroke();
+  }
+}
+
+function drawPill(ctx, x, y, text, fill, textColor) {
+  ctx.font = '600 24px sans-serif';
+  const paddingX = 18;
+  const height = 40;
+  const width = ctx.measureText(text).width + paddingX * 2;
+  roundedRect(ctx, x, y, width, height, 20, fill, null, 0);
+  ctx.fillStyle = textColor;
+  ctx.textAlign = 'left';
+  ctx.textBaseline = 'middle';
+  ctx.fillText(text, x + paddingX, y + height / 2 + 1);
+  return width;
+}
+
+function drawRowCard(ctx, x, y, width, height, row, palette, type) {
+  const topThreeFills = ['rgba(246, 194, 62, 0.18)', 'rgba(173, 181, 189, 0.16)', 'rgba(205, 127, 50, 0.16)'];
+  const topThreeStrokes = ['rgba(246, 194, 62, 0.45)', 'rgba(173, 181, 189, 0.38)', 'rgba(205, 127, 50, 0.36)'];
+  const isTopThree = row.rank <= 3;
+  roundedRect(
+    ctx,
+    x,
+    y,
+    width,
+    height,
+    26,
+    isTopThree ? topThreeFills[row.rank - 1] : 'rgba(255,255,255,0.035)',
+    isTopThree ? topThreeStrokes[row.rank - 1] : 'rgba(255,255,255,0.08)',
+    1.5
+  );
+
+  const medal = row.rank === 1 ? '🥇' : row.rank === 2 ? '🥈' : row.rank === 3 ? '🥉' : `${row.rank}.`;
+  ctx.textBaseline = 'middle';
+  ctx.textAlign = 'left';
+
+  ctx.font = row.rank <= 3 ? '700 34px sans-serif' : '700 30px sans-serif';
+  ctx.fillStyle = isTopThree ? '#FFFFFF' : '#E7EBF4';
+  ctx.fillText(medal, x + 26, y + height / 2);
+
+  const leftStart = x + 96;
+  const metricBlockWidth = type === 'reactions' ? 170 : 410;
+  const nameWidth = width - (leftStart - x) - metricBlockWidth - 30;
+  const safeName = trimText(ctx, row.name, nameWidth);
+
+  ctx.font = '700 30px sans-serif';
+  ctx.fillStyle = '#FFFFFF';
+  ctx.fillText(safeName, leftStart, y + 33);
+
+  ctx.font = '500 20px sans-serif';
+  ctx.fillStyle = '#98A3B8';
+  ctx.fillText(type === 'reactions' ? 'Reaction leaderboard' : 'Graded play results', leftStart, y + 66);
+
+  ctx.textAlign = 'right';
+  if (type === 'reactions') {
+    ctx.font = '800 32px sans-serif';
+    ctx.fillStyle = '#FFFFFF';
+    ctx.fillText(String(row.reactions), x + width - 26, y + 31);
+
+    ctx.font = '600 20px sans-serif';
+    ctx.fillStyle = '#AAB5C8';
+    ctx.fillText(row.reactions === 1 ? 'reaction' : 'reactions', x + width - 26, y + 64);
+  } else {
+    ctx.font = '800 30px sans-serif';
+    ctx.fillStyle = '#FFFFFF';
+    ctx.fillText(`${row.wins}-${row.losses}`, x + width - 26, y + 26);
+
+    ctx.font = '600 18px sans-serif';
+    ctx.fillStyle = '#AAB5C8';
+    ctx.fillText(`${cleanPct(row.winPct)}% win rate`, x + width - 26, y + 50);
+    ctx.fillText(`${row.total} ${row.total === 1 ? 'grade' : 'grades'}`, x + width - 26, y + 72);
+  }
+}
+
+async function renderLeaderboardImage({ type, period, rows, stats, guild }) {
+  if (!createCanvas) return null;
+
+  const normalizedType = normalizeLeaderboardType(type);
+  const normalizedPeriod = normalizePeriod(period);
+  const accent = normalizedType === 'reactions' ? '#FFB020' : '#12A9FF';
+  const headerEmoji = normalizedType === 'reactions' ? '⚡' : '🏆';
+  const title = `${headerEmoji} BaliHQ ${periodLabel(normalizedPeriod)} ${normalizedType === 'reactions' ? 'Reactions' : 'Win/Loss'} Leaderboard`;
+  const subtitle = normalizedType === 'reactions'
+    ? `Reaction leaderboard • ${periodWindowText(normalizedPeriod)}`
+    : `Graded play results • ${periodWindowText(normalizedPeriod)}`;
+
+  const resolvedRows = [];
+  for (const [index, row] of rows.entries()) {
+    resolvedRows.push({
+      ...row,
+      rank: index + 1,
+      name: await resolveDisplayName(row.userId, guild)
+    });
+  }
+
+  const visibleRows = resolvedRows.slice(0, 10);
+  const rowHeight = 92;
+  const height = 260 + Math.max(visibleRows.length, 1) * (rowHeight + 16) + 120;
+  const width = 1200;
+  const canvas = createCanvas(width, height);
+  const ctx = canvas.getContext('2d');
+
+  const grad = ctx.createLinearGradient(0, 0, width, height);
+  grad.addColorStop(0, '#0A1020');
+  grad.addColorStop(0.55, '#0B1222');
+  grad.addColorStop(1, '#070B14');
+  ctx.fillStyle = grad;
+  ctx.fillRect(0, 0, width, height);
+
+  // glow accent
+  ctx.save();
+  ctx.globalAlpha = 0.16;
+  ctx.fillStyle = accent;
+  ctx.beginPath();
+  ctx.arc(width - 120, 120, 180, 0, Math.PI * 2);
+  ctx.fill();
+  ctx.restore();
+
+  roundedRect(ctx, 28, 28, width - 56, height - 56, 32, 'rgba(255,255,255,0.025)', 'rgba(255,255,255,0.07)', 1.2);
+  ctx.fillStyle = accent;
+  roundedRect(ctx, 28, 28, 8, height - 56, 4, accent);
+
+  ctx.textAlign = 'left';
+  ctx.textBaseline = 'top';
+  ctx.fillStyle = '#F8FAFC';
+  ctx.font = '800 44px sans-serif';
+  ctx.fillText(title, 72, 56);
+
+  ctx.fillStyle = '#B7C2D9';
+  ctx.font = '500 26px sans-serif';
+  ctx.fillText(subtitle, 72, 112);
+
+  let pillX = 72;
+  pillX += drawPill(ctx, pillX, 156, periodWindowText(normalizedPeriod), 'rgba(255,255,255,0.08)', '#EAF1FF') + 12;
+  pillX += drawPill(ctx, pillX, 156, `${stats.playCount} ${stats.playCount === 1 ? 'tracked play' : 'tracked plays'}`, 'rgba(255,255,255,0.08)', '#EAF1FF') + 12;
+  const lastMetric = normalizedType === 'reactions'
+    ? `${stats.pointReactionCount} ${stats.pointReactionCount === 1 ? 'reaction' : 'reactions'}`
+    : `${stats.reactionCount} ${stats.reactionCount === 1 ? 'grade' : 'grades'}`;
+  drawPill(ctx, pillX, 156, lastMetric, 'rgba(255,255,255,0.08)', '#EAF1FF');
+
+  const contentY = 228;
+
+  if (!visibleRows.length) {
+    roundedRect(ctx, 72, contentY, width - 144, 170, 30, 'rgba(255,255,255,0.035)', 'rgba(255,255,255,0.08)', 1);
+    ctx.textAlign = 'center';
+    ctx.textBaseline = 'middle';
+    ctx.fillStyle = '#FFFFFF';
+    ctx.font = '800 34px sans-serif';
+    ctx.fillText('No tracked data yet', width / 2, contentY + 62);
+    ctx.fillStyle = '#AAB5C8';
+    ctx.font = '500 22px sans-serif';
+    ctx.fillText(`Run more tracked plays to populate the ${normalizedType === 'reactions' ? 'reactions' : 'win/loss'} board.`, width / 2, contentY + 108);
+  } else {
+    let y = contentY;
+    for (const row of visibleRows) {
+      drawRowCard(ctx, 72, y, width - 144, rowHeight, row, { accent }, normalizedType);
+      y += rowHeight + 16;
+    }
+  }
+
+  ctx.textAlign = 'left';
+  ctx.textBaseline = 'alphabetic';
+  ctx.fillStyle = '#8C97AC';
+  ctx.font = '500 20px sans-serif';
+  const footerText = `Updated ${formatDateTime(new Date().toISOString())} • BaliHQ Leaderboard`;
+  ctx.fillText(footerText, 72, height - 74);
+
+  if (resolvedRows.length > visibleRows.length) {
+    ctx.textAlign = 'right';
+    ctx.fillText(`Showing top ${visibleRows.length} of ${resolvedRows.length}`, width - 72, height - 74);
+  }
+
+  const buffer = await canvas.encode('png');
+  const fileName = `balihq-${normalizedType}-${normalizedPeriod}-leaderboard.png`;
+  return new AttachmentBuilder(buffer, { name: fileName });
+}
+
+async function leaderboardImageReply(type, limit, period = 'all_time', guild = null) {
+  const normalizedType = normalizeLeaderboardType(type);
+  const normalizedPeriod = normalizePeriod(period);
+  const stats = store.statsForPeriod ? store.statsForPeriod(normalizedPeriod) : store.stats();
+  const rows = normalizedType === 'reactions'
+    ? (store.getReactionsLeaderboard ? store.getReactionsLeaderboard(limit, normalizedPeriod) : store.getReactorsLeaderboard(limit, normalizedPeriod))
+    : store.getWinLossLeaderboard(limit, normalizedPeriod);
+
+  const attachment = await renderLeaderboardImage({
+    type: normalizedType,
+    period: normalizedPeriod,
+    rows,
+    stats,
+    guild
+  });
+
+  return { attachment, rows, stats };
+}
+
 function normalizeLeaderboardType(type) {
   const normalized = String(type || 'win_loss').toLowerCase();
   if (normalized === 'reactions' || normalized === 'reactors' || normalized === 'reaction_points') return 'reactions';
@@ -734,7 +974,13 @@ client.on('interactionCreate', async (interaction) => {
       const limit = interaction.options.getInteger('limit') || 10;
       await interaction.deferReply();
       await runRecentSync('leaderboard-command');
-      await interaction.editReply({ embeds: [await leaderboardEmbed(type, limit, period, interaction.guild)] });
+
+      const { attachment } = await leaderboardImageReply(type, limit, period, interaction.guild);
+      if (attachment) {
+        await interaction.editReply({ files: [attachment] });
+      } else {
+        await interaction.editReply({ embeds: [await leaderboardEmbed(type, limit, period, interaction.guild)] });
+      }
       return;
     }
 

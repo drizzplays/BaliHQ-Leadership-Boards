@@ -547,6 +547,42 @@ function rowStroke(rank) {
   return '#2A364E';
 }
 
+
+let leaderboardLogoDataUriCache = null;
+let leaderboardLogoDataUriAttempted = false;
+
+async function fetchImageAsDataUri(url) {
+  if (!url || typeof fetch !== 'function') return null;
+  const response = await fetch(url);
+  if (!response.ok) throw new Error(`logo fetch failed: ${response.status}`);
+  const contentType = response.headers.get('content-type') || 'image/png';
+  const arrayBuffer = await response.arrayBuffer();
+  const base64 = Buffer.from(arrayBuffer).toString('base64');
+  return `data:${contentType};base64,${base64}`;
+}
+
+async function getLeaderboardLogoDataUri() {
+  if (leaderboardLogoDataUriCache || leaderboardLogoDataUriAttempted) return leaderboardLogoDataUriCache;
+  leaderboardLogoDataUriAttempted = true;
+
+  const explicitLogoUrl = process.env.LEADERBOARD_LOGO_URL || process.env.BALIHQ_LOGO_URL;
+  const botAvatarUrl = client.user?.displayAvatarURL
+    ? client.user.displayAvatarURL({ extension: 'png', size: 256 })
+    : null;
+
+  const candidates = [explicitLogoUrl, botAvatarUrl].filter(Boolean);
+  for (const url of candidates) {
+    try {
+      leaderboardLogoDataUriCache = await fetchImageAsDataUri(url);
+      if (leaderboardLogoDataUriCache) return leaderboardLogoDataUriCache;
+    } catch (error) {
+      console.warn(`Leaderboard logo could not load from ${url}: ${error.message}`);
+    }
+  }
+
+  return null;
+}
+
 function safeSvgText(value) {
   return escapeHtml(String(value || '').replace(/[\u0000-\u001F\u007F]/g, ''));
 }
@@ -558,10 +594,11 @@ async function renderLeaderboardImage({ type, period, rows, stats, guild }) {
   const normalizedPeriod = normalizePeriod(period);
   const isReactions = normalizedType === 'reactions';
   const accent = isReactions ? '#FFB020' : '#12A9FF';
-  const accentDark = isReactions ? '#5C3900' : '#003D5C';
-  const titleIcon = isReactions ? 'RXN' : 'W/L';
+  const accentSoft = isReactions ? '#FFE1A3' : '#B9EAFF';
+  const accentDark = isReactions ? '#2B1D05' : '#061C2D';
   const title = `BaliHQ ${periodLabel(normalizedPeriod)} ${isReactions ? 'Reactions' : 'Win/Loss'} Leaderboard`;
   const subtitle = `${isReactions ? 'Reaction leaderboard' : 'Graded play results'} • ${periodWindowText(normalizedPeriod)}`;
+  const logoDataUri = await getLeaderboardLogoDataUri();
 
   const resolvedRows = [];
   for (const [index, row] of rows.entries()) {
@@ -598,13 +635,14 @@ async function renderLeaderboardImage({ type, period, rows, stats, guild }) {
         const rightBig = isReactions ? String(Number(row.reactions ?? row.points ?? 0)) : `${row.wins}-${row.losses}`;
         const rightSmall = isReactions ? (Number(row.reactions ?? row.points ?? 0) === 1 ? 'reaction' : 'reactions') : `${cleanPct(row.winPct)}% win rate`;
         return `
-          <rect x="${cardX}" y="${y}" width="${cardW}" height="${rowHeight}" rx="26" fill="rgba(255,255,255,0.045)" stroke="${stroke}" stroke-opacity="0.55"/>
-          <circle cx="112" cy="${y + 48}" r="28" fill="${badgeFill}"/>
-          <text x="112" y="${y + 58}" text-anchor="middle" font-family="DejaVu Sans, Arial, Helvetica, sans-serif" font-size="28" font-weight="900" fill="#0B1020">${rankMedal(rank)}</text>
-          <text x="160" y="${y + 41}" font-family="DejaVu Sans, Arial, Helvetica, sans-serif" font-size="31" font-weight="800" fill="#FFFFFF">${name}</text>
-          <text x="160" y="${y + 73}" font-family="DejaVu Sans, Arial, Helvetica, sans-serif" font-size="22" font-weight="600" fill="#AAB5C8">${safeSvgText(resultLine)}</text>
-          <text x="${width - 92}" y="${y + 39}" text-anchor="end" font-family="DejaVu Sans, Arial, Helvetica, sans-serif" font-size="32" font-weight="900" fill="#FFFFFF">${safeSvgText(rightBig)}</text>
-          <text x="${width - 92}" y="${y + 70}" text-anchor="end" font-family="DejaVu Sans, Arial, Helvetica, sans-serif" font-size="20" font-weight="700" fill="#AAB5C8">${safeSvgText(rightSmall)}</text>
+          <rect x="${cardX}" y="${y}" width="${cardW}" height="${rowHeight}" rx="24" fill="${rank <= 3 ? `url(#rowTop${rank})` : 'rgba(15,24,42,0.92)'}" stroke="${stroke}" stroke-opacity="0.62"/>
+          <rect x="${cardX + 1}" y="${y + 1}" width="5" height="${rowHeight - 2}" rx="3" fill="${rank <= 3 ? stroke : 'rgba(80,102,140,0.55)'}" opacity="0.9"/>
+          <circle cx="112" cy="${y + 48}" r="29" fill="${badgeFill}"/>
+          <text x="112" y="${y + 58}" text-anchor="middle" font-family="DejaVu Sans, Arial, Helvetica, sans-serif" font-size="28" font-weight="900" fill="#07101F">${rankMedal(rank)}</text>
+          <text x="160" y="${y + 40}" font-family="DejaVu Sans, Arial, Helvetica, sans-serif" font-size="32" font-weight="900" fill="#FFFFFF">${name}</text>
+          <text x="160" y="${y + 73}" font-family="DejaVu Sans, Arial, Helvetica, sans-serif" font-size="22" font-weight="700" fill="#B9C5DA">${safeSvgText(resultLine)}</text>
+          <text x="${width - 92}" y="${y + 39}" text-anchor="end" font-family="DejaVu Sans, Arial, Helvetica, sans-serif" font-size="34" font-weight="900" fill="#FFFFFF">${safeSvgText(rightBig)}</text>
+          <text x="${width - 92}" y="${y + 70}" text-anchor="end" font-family="DejaVu Sans, Arial, Helvetica, sans-serif" font-size="20" font-weight="800" fill="#B9C5DA">${safeSvgText(rightSmall)}</text>
         `;
       }).join('')
     : `
@@ -626,6 +664,19 @@ async function renderLeaderboardImage({ type, period, rows, stats, guild }) {
         <stop offset="0" stop-color="${accent}" stop-opacity="0.26"/>
         <stop offset="1" stop-color="${accent}" stop-opacity="0"/>
       </radialGradient>
+      <linearGradient id="rowTop1" x1="0" y1="0" x2="1" y2="0">
+        <stop offset="0" stop-color="rgba(247,201,72,0.22)"/>
+        <stop offset="1" stop-color="rgba(16,27,47,0.94)"/>
+      </linearGradient>
+      <linearGradient id="rowTop2" x1="0" y1="0" x2="1" y2="0">
+        <stop offset="0" stop-color="rgba(174,183,200,0.18)"/>
+        <stop offset="1" stop-color="rgba(16,27,47,0.94)"/>
+      </linearGradient>
+      <linearGradient id="rowTop3" x1="0" y1="0" x2="1" y2="0">
+        <stop offset="0" stop-color="rgba(196,122,57,0.20)"/>
+        <stop offset="1" stop-color="rgba(16,27,47,0.94)"/>
+      </linearGradient>
+      <clipPath id="logoClip"><circle cx="98" cy="84" r="45"/></clipPath>
       <filter id="shadow" x="-20%" y="-20%" width="140%" height="140%">
         <feDropShadow dx="0" dy="16" stdDeviation="18" flood-color="#000000" flood-opacity="0.35"/>
       </filter>
@@ -633,19 +684,20 @@ async function renderLeaderboardImage({ type, period, rows, stats, guild }) {
 
     <rect width="${width}" height="${height}" fill="url(#bg)"/>
     <rect width="${width}" height="${height}" fill="url(#glow)"/>
-    <rect x="28" y="28" width="${width - 56}" height="${height - 56}" rx="34" fill="rgba(255,255,255,0.025)" stroke="rgba(255,255,255,0.08)" filter="url(#shadow)"/>
+    <rect x="28" y="28" width="${width - 56}" height="${height - 56}" rx="34" fill="rgba(255,255,255,0.030)" stroke="rgba(255,255,255,0.10)" filter="url(#shadow)"/>
     <rect x="28" y="28" width="8" height="${height - 56}" rx="4" fill="${accent}"/>
 
-    <circle cx="96" cy="82" r="42" fill="${accentDark}" stroke="${accent}" stroke-width="2"/>
-    <text x="96" y="98" text-anchor="middle" font-family="DejaVu Sans, Arial, Helvetica, sans-serif" font-size="27" font-weight="900" fill="#FFFFFF">${titleIcon}</text>
-    <text x="154" y="78" font-family="DejaVu Sans, Arial, Helvetica, sans-serif" font-size="44" font-weight="900" fill="#F8FAFC">${safeSvgText(title)}</text>
-    <text x="154" y="122" font-family="DejaVu Sans, Arial, Helvetica, sans-serif" font-size="25" font-weight="600" fill="#B7C2D9">${safeSvgText(subtitle)}</text>
+    <circle cx="98" cy="84" r="50" fill="rgba(255,255,255,0.06)" stroke="${accent}" stroke-width="3"/>
+    ${logoDataUri ? `<image href="${logoDataUri}" x="53" y="39" width="90" height="90" clip-path="url(#logoClip)" preserveAspectRatio="xMidYMid slice"/>` : `<text x="98" y="92" text-anchor="middle" font-family="DejaVu Sans, Arial, Helvetica, sans-serif" font-size="24" font-weight="900" fill="#FFFFFF">BHQ</text>`}
+    <text x="166" y="70" font-family="DejaVu Sans, Arial, Helvetica, sans-serif" font-size="41" font-weight="900" fill="#F8FAFC">${safeSvgText(title)}</text>
+    <text x="166" y="118" font-family="DejaVu Sans, Arial, Helvetica, sans-serif" font-size="24" font-weight="700" fill="#B7C2D9">${safeSvgText(subtitle)}</text>
+    <text x="${width - 70}" y="74" text-anchor="end" font-family="DejaVu Sans, Arial, Helvetica, sans-serif" font-size="18" font-weight="900" letter-spacing="3" fill="${accentSoft}">BALI HQ</text>
 
-    <rect x="64" y="160" width="300" height="42" rx="21" fill="rgba(255,255,255,0.075)"/>
+    <rect x="64" y="160" width="300" height="42" rx="21" fill="rgba(255,255,255,0.085)"/>
     <text x="84" y="188" font-family="DejaVu Sans, Arial, Helvetica, sans-serif" font-size="22" font-weight="800" fill="#EAF1FF">${safeSvgText(periodWindowText(normalizedPeriod))}</text>
-    <rect x="380" y="160" width="260" height="42" rx="21" fill="rgba(255,255,255,0.075)"/>
+    <rect x="380" y="160" width="260" height="42" rx="21" fill="rgba(255,255,255,0.085)"/>
     <text x="400" y="188" font-family="DejaVu Sans, Arial, Helvetica, sans-serif" font-size="22" font-weight="800" fill="#EAF1FF">${stats.playCount} ${stats.playCount === 1 ? 'tracked play' : 'tracked plays'}</text>
-    <rect x="656" y="160" width="230" height="42" rx="21" fill="rgba(255,255,255,0.075)"/>
+    <rect x="656" y="160" width="230" height="42" rx="21" fill="rgba(255,255,255,0.085)"/>
     <text x="676" y="188" font-family="DejaVu Sans, Arial, Helvetica, sans-serif" font-size="22" font-weight="800" fill="#EAF1FF">${safeSvgText(metricText)}</text>
 
     ${rowsSvg}

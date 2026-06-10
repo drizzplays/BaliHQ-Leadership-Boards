@@ -153,3 +153,7 @@ git branch -M main
 git remote add origin https://github.com/YOUR_USERNAME/balihq-auto-reaction-leaderboard-bot.git
 git push -u origin main
 ```
+
+## Update notes
+
+Leaderboard embeds do not display internal emoji IDs. Emoji IDs remain configurable through Render environment variables.

@@ -1,5 +1,11 @@
 const { SlashCommandBuilder } = require('discord.js');
 
+const periodChoices = [
+  { name: 'Weekly', value: 'weekly' },
+  { name: 'Monthly', value: 'monthly' },
+  { name: 'All Time', value: 'all_time' }
+];
+
 const commandData = [
   new SlashCommandBuilder()
     .setName('leaderboard')
@@ -10,8 +16,14 @@ const commandData = [
         .setDescription('Which leaderboard to show.')
         .addChoices(
           { name: 'Win / Loss', value: 'win_loss' },
-          { name: 'Reactors', value: 'reactors' }
+          { name: 'Reactions', value: 'reactions' }
         )
+    )
+    .addStringOption((option) =>
+      option
+        .setName('period')
+        .setDescription('Leaderboard time window.')
+        .addChoices(...periodChoices)
     )
     .addIntegerOption((option) =>
       option
@@ -23,11 +35,17 @@ const commandData = [
 
   new SlashCommandBuilder()
     .setName('record')
-    .setDescription('Show a user record and reactor points.')
+    .setDescription('Show a user win/loss record and reaction count.')
     .addUserOption((option) =>
       option
         .setName('user')
         .setDescription('User to check. Defaults to you.')
+    )
+    .addStringOption((option) =>
+      option
+        .setName('period')
+        .setDescription('Record time window.')
+        .addChoices(...periodChoices)
     ),
 
   new SlashCommandBuilder()

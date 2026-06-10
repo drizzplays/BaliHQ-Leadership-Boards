@@ -3,7 +3,8 @@ const {
   GatewayIntentBits,
   Partials,
   EmbedBuilder,
-  PermissionFlagsBits
+  PermissionFlagsBits,
+  MessageFlags
 } = require('discord.js');
 const { config } = require('./config');
 const { Store } = require('./store');
@@ -129,23 +130,23 @@ function passesPlayTextFilters(message) {
   return true;
 }
 
-async function shouldTrackMessage(message) {
-  if (!message || !message.id || !message.guildId) return false;
-  if (!config.trackChannelIds.includes(message.channelId)) return false;
-  if (!isAfterStart(message)) return false;
+function trackRejectReason(message) {
+  if (!message || !message.id || !message.guildId) return 'invalid-message';
+  if (!config.trackChannelIds.includes(message.channelId)) return 'untracked-channel';
+  if (!isAfterStart(message)) return 'before-track-after';
 
   // Never track this leaderboard bot's own command responses.
-  if (client.user?.id && message.author?.id === client.user.id) return false;
+  if (client.user?.id && message.author?.id === client.user.id) return 'own-message';
 
   if (config.trackWebhookIds.length > 0 && !config.trackWebhookIds.includes(message.webhookId)) {
-    return false;
+    return 'webhook-id-filter';
   }
 
   if (config.trackAuthorIds.length > 0 && !config.trackAuthorIds.includes(message.author?.id)) {
-    return false;
+    return 'author-id-filter';
   }
 
-  if (!passesPlayTextFilters(message)) return false;
+  if (!passesPlayTextFilters(message)) return 'text-filter';
 
   // BaliBot may post as a real webhook OR as a Discord app/bot message.
   // Do not count random human chatter in tracked channels unless explicitly enabled.
@@ -153,14 +154,18 @@ async function shouldTrackMessage(message) {
   const isBotOrAppPost = Boolean(message.author?.bot || message.applicationId);
 
   if (config.requireWebhook && !isWebhookPost) {
-    if (!config.allowBotPlayAlerts || !isBotOrAppPost) return false;
+    if (!config.allowBotPlayAlerts || !isBotOrAppPost) return 'not-webhook-or-allowed-bot';
   }
 
   if (!isWebhookPost && !isBotOrAppPost && !config.allowHumanPlayAlerts) {
-    return false;
+    return 'human-message-disabled';
   }
 
-  return true;
+  return null;
+}
+
+async function shouldTrackMessage(message) {
+  return trackRejectReason(message) === null;
 }
 
 function trackMessage(message) {
@@ -335,29 +340,71 @@ async function syncRecent(limit = config.syncLimit) {
   let reactionLosses = 0;
   let reactorPoints = 0;
   let ambiguous = 0;
+  let channelsChecked = 0;
+  let channelErrors = 0;
+  let messageErrors = 0;
+  const skipped = {};
+
+  function bumpSkip(reason) {
+    skipped[reason] = (skipped[reason] || 0) + 1;
+  }
 
   for (const channelId of config.trackChannelIds) {
-    const channel = await client.channels.fetch(channelId).catch(() => null);
-    if (!channel || !channel.isTextBased()) continue;
+    try {
+      const channel = await client.channels.fetch(channelId).catch((error) => {
+        throw new Error(`fetch channel failed: ${error.message}`);
+      });
 
-    const messages = await channel.messages.fetch({ limit: Math.min(Number(limit) || 100, 100) });
-    const sortedMessages = Array.from(messages.values()).sort((a, b) => a.createdTimestamp - b.createdTimestamp);
+      if (!channel || !channel.isTextBased()) {
+        channelErrors += 1;
+        console.warn(`Skipping channel ${channelId}: not found or not text-based.`);
+        continue;
+      }
 
-    for (const message of sortedMessages) {
-      scanned += 1;
-      if (!(await shouldTrackMessage(message))) continue;
-      trackMessage(message);
-      tracked += 1;
-      const result = await syncMessageReactions(message);
-      reactionWins += result.wins;
-      reactionLosses += result.losses;
-      reactorPoints += result.points;
-      ambiguous += result.ambiguous;
+      channelsChecked += 1;
+      const messages = await channel.messages.fetch({ limit: Math.min(Number(limit) || 100, 100) });
+      const sortedMessages = Array.from(messages.values()).sort((a, b) => a.createdTimestamp - b.createdTimestamp);
+
+      for (const message of sortedMessages) {
+        scanned += 1;
+        try {
+          const rejectReason = trackRejectReason(message);
+          if (rejectReason) {
+            bumpSkip(rejectReason);
+            continue;
+          }
+
+          trackMessage(message);
+          tracked += 1;
+          const result = await syncMessageReactions(message);
+          reactionWins += result.wins;
+          reactionLosses += result.losses;
+          reactorPoints += result.points;
+          ambiguous += result.ambiguous;
+        } catch (error) {
+          messageErrors += 1;
+          console.warn(`Skipping message ${message.id} in channel ${channelId}: ${error.message}`);
+        }
+      }
+    } catch (error) {
+      channelErrors += 1;
+      console.warn(`Sync skipped channel ${channelId}: ${error.message}`);
     }
   }
 
   store.setLastSyncNow();
-  return { scanned, tracked, reactionWins, reactionLosses, reactorPoints, ambiguous };
+  return {
+    scanned,
+    tracked,
+    reactionWins,
+    reactionLosses,
+    reactorPoints,
+    ambiguous,
+    channelsChecked,
+    channelErrors,
+    messageErrors,
+    skipped
+  };
 }
 
 let syncInProgress = false;
@@ -383,41 +430,179 @@ async function runRecentSync(reason = 'auto') {
   }
 }
 
-function winLossLeaderboardEmbed(limit) {
-  const rows = store.getWinLossLeaderboard(limit);
-  return new EmbedBuilder()
-    .setTitle('🏝️ BaliHQ Win/Loss Leaderboard')
-    .setDescription(rows.length ? rows.map((row, index) => {
-      return `**${index + 1}.** <@${row.userId}> — **${row.wins}-${row.losses}** | **${row.winPct}%** | ${row.total} graded`;
-    }).join('\n') : 'No win/loss reactions yet.')
+function formatDateTime(value) {
+  if (!value) return 'Never';
+  const date = new Date(value);
+  if (Number.isNaN(date.getTime())) return 'Unknown';
+  return date.toLocaleString('en-US', {
+    month: 'short',
+    day: 'numeric',
+    year: 'numeric',
+    hour: 'numeric',
+    minute: '2-digit'
+  });
+}
+
+function plural(count, singular, pluralWord = `${singular}s`) {
+  return `${count} ${count === 1 ? singular : pluralWord}`;
+}
+
+function rankBadge(index) {
+  if (index === 0) return '🥇';
+  if (index === 1) return '🥈';
+  if (index === 2) return '🥉';
+  return `**${index + 1}.**`;
+}
+
+function cleanPct(value) {
+  const number = Number(value || 0);
+  if (Number.isInteger(number)) return String(number);
+  return number.toFixed(1).replace(/\.0$/, '');
+}
+
+function normalizeLeaderboardType(type) {
+  const normalized = String(type || 'win_loss').toLowerCase();
+  if (normalized === 'reactions' || normalized === 'reactors' || normalized === 'reaction_points') return 'reactions';
+  return 'win_loss';
+}
+
+function normalizePeriod(period) {
+  const normalized = String(period || 'all_time').toLowerCase();
+  if (normalized === 'weekly' || normalized === 'week') return 'weekly';
+  if (normalized === 'monthly' || normalized === 'month') return 'monthly';
+  return 'all_time';
+}
+
+function periodLabel(period) {
+  const normalized = normalizePeriod(period);
+  if (normalized === 'weekly') return 'Weekly';
+  if (normalized === 'monthly') return 'Monthly';
+  return 'All-Time';
+}
+
+function periodWindowText(period) {
+  const normalized = normalizePeriod(period);
+  if (normalized === 'weekly') return 'Last 7 days';
+  if (normalized === 'monthly') return 'Last 30 days';
+  return 'Full tracked history';
+}
+
+function lastUpdatedFooter(period, extraParts = []) {
+  const stats = store.statsForPeriod ? store.statsForPeriod(normalizePeriod(period)) : store.stats();
+  const parts = [
+    periodWindowText(period),
+    plural(stats.playCount, 'tracked play'),
+    ...extraParts.filter(Boolean),
+    `Updated ${formatDateTime(new Date().toISOString())}`
+  ];
+  return parts.join(' • ');
+}
+
+function leaderboardHeader(type, period) {
+  const label = periodLabel(period);
+  if (type === 'reactions') return `⚡ BaliHQ ${label} Reactions Leaderboard`;
+  return `🏆 BaliHQ ${label} Win/Loss Leaderboard`;
+}
+
+function winLossLeaderboardEmbed(limit, period = 'all_time') {
+  const normalizedPeriod = normalizePeriod(period);
+  const rows = store.getWinLossLeaderboard(limit, normalizedPeriod);
+  const stats = store.statsForPeriod ? store.statsForPeriod(normalizedPeriod) : store.stats();
+
+  const embed = new EmbedBuilder()
+    .setColor(0x00AEEF)
+    .setTitle(leaderboardHeader('win_loss', normalizedPeriod))
+    .setDescription(
+      rows.length
+        ? `BaliHQ graded play reactions • **${periodWindowText(normalizedPeriod)}**`
+        : `No win/loss grades tracked for **${periodWindowText(normalizedPeriod)}** yet.`
+    )
+    .setFooter({ text: lastUpdatedFooter(normalizedPeriod, [plural(stats.reactionCount, 'win/loss grade')]) })
     .setTimestamp(new Date());
+
+  if (!rows.length) return embed;
+
+  for (const [index, row] of rows.entries()) {
+    const pct = cleanPct(row.winPct);
+    embed.addFields({
+      name: `${rankBadge(index)} <@${row.userId}>`,
+      value: [
+        `**Record:** ${row.wins}-${row.losses}`,
+        `**Win Rate:** ${pct}%`,
+        `**Graded Plays:** ${row.total}`
+      ].join('  •  '),
+      inline: false
+    });
+  }
+
+  return embed;
 }
 
-function reactorsLeaderboardEmbed(limit) {
-  const rows = store.getReactorsLeaderboard(limit);
-  return new EmbedBuilder()
-    .setTitle('🏝️ BaliHQ Reactors Leaderboard')
-    .setDescription(rows.length ? rows.map((row, index) => {
-      return `**${index + 1}.** <@${row.userId}> — **${row.points}** pts`;
-    }).join('\n') : 'No reactor points yet.')
+function reactionsLeaderboardEmbed(limit, period = 'all_time') {
+  const normalizedPeriod = normalizePeriod(period);
+  const rows = store.getReactionsLeaderboard
+    ? store.getReactionsLeaderboard(limit, normalizedPeriod)
+    : store.getReactorsLeaderboard(limit, normalizedPeriod);
+  const stats = store.statsForPeriod ? store.statsForPeriod(normalizedPeriod) : store.stats();
+
+  const embed = new EmbedBuilder()
+    .setColor(0xFFB000)
+    .setTitle(leaderboardHeader('reactions', normalizedPeriod))
+    .setDescription(
+      rows.length
+        ? `BaliHQ reaction-point emoji rankings • **${periodWindowText(normalizedPeriod)}**`
+        : `No reaction points tracked for **${periodWindowText(normalizedPeriod)}** yet.`
+    )
+    .setFooter({ text: lastUpdatedFooter(normalizedPeriod, [plural(stats.pointReactionCount, 'reaction')]) })
     .setTimestamp(new Date());
+
+  if (!rows.length) return embed;
+
+  for (const [index, row] of rows.entries()) {
+    const reactions = Number(row.reactions ?? row.points ?? 0);
+    embed.addFields({
+      name: `${rankBadge(index)} <@${row.userId}>`,
+      value: `**${plural(reactions, 'reaction')}**`,
+      inline: false
+    });
+  }
+
+  return embed;
 }
 
-function leaderboardEmbed(type, limit) {
-  if (type === 'reactors') return reactorsLeaderboardEmbed(limit);
-  return winLossLeaderboardEmbed(limit);
+function leaderboardEmbed(type, limit, period = 'all_time') {
+  const normalizedType = normalizeLeaderboardType(type);
+  if (normalizedType === 'reactions') return reactionsLeaderboardEmbed(limit, period);
+  return winLossLeaderboardEmbed(limit, period);
 }
 
-function recordEmbed(userId) {
-  const row = store.getUserRecord(userId);
-  const points = store.getUserPoints(userId);
+function recordEmbed(userId, period = 'all_time') {
+  const normalizedPeriod = normalizePeriod(period);
+  const row = store.getUserRecord(userId, normalizedPeriod);
+  const reactionRow = store.getUserPoints(userId, normalizedPeriod);
+  const pct = cleanPct(row.winPct);
+
   return new EmbedBuilder()
-    .setTitle('🏝️ BaliHQ User Record')
-    .setDescription([
-      `<@${row.userId}>`,
-      `Win/Loss: **${row.wins}-${row.losses}** | **${row.winPct}%** | ${row.total} graded`,
-      `Reactors: **${points.points}** pts`
-    ].join('\n'))
+    .setColor(0x00AEEF)
+    .setTitle(`📌 BaliHQ ${periodLabel(normalizedPeriod)} Member Record`)
+    .setDescription(`<@${row.userId}> • **${periodWindowText(normalizedPeriod)}**`)
+    .addFields(
+      {
+        name: 'Win/Loss',
+        value: [
+          `**Record:** ${row.wins}-${row.losses}`,
+          `**Win Rate:** ${pct}%`,
+          `**Graded Plays:** ${row.total}`
+        ].join('  •  '),
+        inline: false
+      },
+      {
+        name: 'Reactions',
+        value: `**${plural(Number(reactionRow.points || 0), 'reaction')}**`,
+        inline: false
+      }
+    )
+    .setFooter({ text: 'BaliHQ Leaderboard' })
     .setTimestamp(new Date());
 }
 
@@ -513,51 +698,113 @@ client.on('interactionCreate', async (interaction) => {
   try {
     if (interaction.commandName === 'leaderboard') {
       const type = interaction.options.getString('type') || 'win_loss';
+      const period = interaction.options.getString('period') || 'all_time';
       const limit = interaction.options.getInteger('limit') || 10;
       await interaction.deferReply();
       await runRecentSync('leaderboard-command');
-      await interaction.editReply({ embeds: [leaderboardEmbed(type, limit)] });
+      await interaction.editReply({ embeds: [leaderboardEmbed(type, limit, period)] });
       return;
     }
 
     if (interaction.commandName === 'record') {
       const user = interaction.options.getUser('user') || interaction.user;
-      await interaction.deferReply({ ephemeral: true });
+      const period = interaction.options.getString('period') || 'all_time';
+      await interaction.deferReply({ flags: MessageFlags.Ephemeral });
       await runRecentSync('record-command');
-      await interaction.editReply({ embeds: [recordEmbed(user.id)] });
+      await interaction.editReply({ embeds: [recordEmbed(user.id, period)] });
       return;
     }
 
 
     if (interaction.commandName === 'botstatus') {
-      await interaction.deferReply({ ephemeral: true });
+      await interaction.deferReply({ flags: MessageFlags.Ephemeral });
       await runRecentSync('botstatus-command');
       const stats = store.stats();
       const syncLine = lastSyncResult
-        ? `Latest sync: scanned **${lastSyncResult.scanned}** messages, tracked **${lastSyncResult.tracked}** play alerts, found **${lastSyncResult.reactionWins + lastSyncResult.reactionLosses}** win/loss reactions and **${lastSyncResult.reactorPoints}** reactor points.`
+        ? `Latest sync: scanned **${lastSyncResult.scanned}** messages in **${lastSyncResult.channelsChecked || 0}** channels, tracked **${lastSyncResult.tracked}** play alerts, found **${lastSyncResult.reactionWins + lastSyncResult.reactionLosses}** win/loss reactions and **${lastSyncResult.reactorPoints}** reactions.`
         : 'Latest sync: not available yet.';
+      const skippedLine = lastSyncResult?.skipped
+        ? `Skipped: ${Object.entries(lastSyncResult.skipped).slice(0, 6).map(([key, value]) => `${key}: ${value}`).join(', ') || 'none'}`
+        : 'Skipped: not available yet.';
+      const errorLine = lastSyncResult
+        ? `Sync errors: channels **${lastSyncResult.channelErrors || 0}**, messages **${lastSyncResult.messageErrors || 0}**`
+        : 'Sync errors: not available yet.';
+
+      const skippedSummary = lastSyncResult?.skipped
+        ? Object.entries(lastSyncResult.skipped)
+            .sort((a, b) => b[1] - a[1])
+            .slice(0, 4)
+            .map(([key, value]) => `${key}: ${value}`)
+            .join(' • ') || 'None'
+        : 'Not available yet';
+
+      const allowedSources = config.requireWebhook
+        ? (config.allowBotPlayAlerts ? 'Webhook + bot/app alerts' : 'Webhook alerts only')
+        : (config.allowHumanPlayAlerts ? 'Webhook + bot/app + human alerts' : 'Webhook + bot/app alerts');
 
       const embed = new EmbedBuilder()
-        .setTitle('🏝️ BaliHQ Tracker Status')
-        .setDescription([
-          `Online as: <@${client.user.id}>`,
-          `Tracking channels: ${config.trackChannelIds.map((id) => `<#${id}>`).join(', ')}`,
-          `Tracking after: **${store.getStartIso(config.trackAfterIso)}**`,
-          `Last sync: **${stats.lastSyncIso || 'never'}**`,
-          syncLine,
-          `Auto sync interval: **${config.autoSyncIntervalSeconds > 0 ? `${Math.max(config.autoSyncIntervalSeconds, 30)}s` : 'off'}**`,
-          `Tracked plays: **${stats.playCount}**`,
-          `Stored win/loss reactions: **${stats.reactionCount}**`,
-          `Stored reactor-point reactions: **${stats.pointReactionCount}**`,
-          `Allowed play sources: **${config.requireWebhook ? 'webhook only, plus bot/app alerts if enabled' : 'webhook + bot/app alerts'}**`
-        ].join('\n'))
+        .setColor(0x00AEEF)
+        .setTitle('📊 BaliHQ Tracker Status')
+        .setDescription('System health and tracking summary for the BaliHQ leaderboard bot.')
+        .addFields(
+          {
+            name: 'System',
+            value: [
+              `**Status:** Online`,
+              `**Online as:** <@${client.user.id}>`,
+              `**Tracked channels:** ${config.trackChannelIds.length}`,
+              `**Sync interval:** ${config.autoSyncIntervalSeconds > 0 ? `${Math.max(config.autoSyncIntervalSeconds, 30)}s` : 'Off'}`
+            ].join('\n'),
+            inline: false
+          },
+          {
+            name: 'Tracking Window',
+            value: [
+              `**Tracking since:** ${formatDateTime(store.getStartIso(config.trackAfterIso))}`,
+              `**Last stored sync:** ${formatDateTime(stats.lastSyncIso)}`,
+              `**Latest command sync:** ${lastSyncResult?.atIso ? formatDateTime(lastSyncResult.atIso) : 'Not available yet'}`
+            ].join('\n'),
+            inline: false
+          },
+          {
+            name: 'Current Data',
+            value: [
+              `**Tracked plays:** ${stats.playCount}`,
+              `**Win/Loss grades:** ${stats.reactionCount}`,
+              `**Reactions:** ${stats.pointReactionCount}`
+            ].join('\n'),
+            inline: true
+          },
+          {
+            name: 'Last Sync Scan',
+            value: lastSyncResult
+              ? [
+                  `**Messages scanned:** ${lastSyncResult.scanned}`,
+                  `**Channels checked:** ${lastSyncResult.channelsChecked || 0}`,
+                  `**New/updated plays:** ${lastSyncResult.tracked}`,
+                  `**Errors:** ${(lastSyncResult.channelErrors || 0) + (lastSyncResult.messageErrors || 0)}`
+                ].join('\n')
+              : 'Not available yet',
+            inline: true
+          },
+          {
+            name: 'Rules',
+            value: [
+              `**Allowed sources:** ${allowedSources}`,
+              `**Human messages:** ${config.allowHumanPlayAlerts ? 'On' : 'Off'}`,
+              `**Skipped summary:** ${skippedSummary}`
+            ].join('\n'),
+            inline: false
+          }
+        )
+        .setFooter({ text: 'BaliHQ Leaderboard' })
         .setTimestamp(new Date());
       await interaction.editReply({ embeds: [embed] });
       return;
     }
   } catch (error) {
     console.error('interaction failed:', error);
-    const payload = { content: `Command failed: ${error.message}`, ephemeral: true };
+    const payload = { content: `Command failed: ${error.message}`, flags: MessageFlags.Ephemeral };
     if (interaction.deferred || interaction.replied) await interaction.editReply(payload);
     else await interaction.reply(payload);
   }

@@ -152,13 +152,14 @@ class Store {
     this.save();
   }
 
-  getUserRecord(userId) {
+  getUserRecord(userId, period = 'all_time') {
     let wins = 0;
     let losses = 0;
 
     for (const reaction of Object.values(this.state.reactions)) {
       if (reaction.userId !== userId) continue;
-      if (!this.state.plays[reaction.messageId]) continue;
+      const play = this.state.plays[reaction.messageId];
+      if (!play || !playInPeriod(play, period)) continue;
       if (reaction.result === 'win') wins += 1;
       if (reaction.result === 'loss') losses += 1;
     }
@@ -166,23 +167,25 @@ class Store {
     return formatRecord(userId, wins, losses);
   }
 
-  getUserPoints(userId) {
+  getUserPoints(userId, period = 'all_time') {
     let points = 0;
 
     for (const reaction of Object.values(this.state.pointReactions)) {
       if (reaction.userId !== userId) continue;
-      if (!this.state.plays[reaction.messageId]) continue;
+      const play = this.state.plays[reaction.messageId];
+      if (!play || !playInPeriod(play, period)) continue;
       points += Number(reaction.points || 1);
     }
 
     return { userId, points };
   }
 
-  getWinLossLeaderboard(limit = 10) {
+  getWinLossLeaderboard(limit = 10, period = 'all_time') {
     const map = new Map();
 
     for (const reaction of Object.values(this.state.reactions)) {
-      if (!this.state.plays[reaction.messageId]) continue;
+      const play = this.state.plays[reaction.messageId];
+      if (!play || !playInPeriod(play, period)) continue;
       if (!map.has(reaction.userId)) {
         map.set(reaction.userId, { userId: reaction.userId, wins: 0, losses: 0 });
       }
@@ -196,34 +199,41 @@ class Store {
       .sort((a, b) => {
         if (b.wins !== a.wins) return b.wins - a.wins;
         if (b.winPct !== a.winPct) return b.winPct - a.winPct;
-        return b.total - a.total;
-      })
-      .slice(0, limit);
-  }
-
-  getReactorsLeaderboard(limit = 10) {
-    const map = new Map();
-
-    for (const reaction of Object.values(this.state.pointReactions)) {
-      if (!this.state.plays[reaction.messageId]) continue;
-      if (!map.has(reaction.userId)) {
-        map.set(reaction.userId, { userId: reaction.userId, points: 0 });
-      }
-      const row = map.get(reaction.userId);
-      row.points += Number(reaction.points || 1);
-    }
-
-    return Array.from(map.values())
-      .sort((a, b) => {
-        if (b.points !== a.points) return b.points - a.points;
+        if (b.total !== a.total) return b.total - a.total;
         return a.userId.localeCompare(b.userId);
       })
       .slice(0, limit);
   }
 
+  getReactionsLeaderboard(limit = 10, period = 'all_time') {
+    const map = new Map();
+
+    for (const reaction of Object.values(this.state.pointReactions)) {
+      const play = this.state.plays[reaction.messageId];
+      if (!play || !playInPeriod(play, period)) continue;
+      if (!map.has(reaction.userId)) {
+        map.set(reaction.userId, { userId: reaction.userId, reactions: 0, points: 0 });
+      }
+      const row = map.get(reaction.userId);
+      row.reactions += Number(reaction.points || 1);
+      row.points = row.reactions;
+    }
+
+    return Array.from(map.values())
+      .sort((a, b) => {
+        if (b.reactions !== a.reactions) return b.reactions - a.reactions;
+        return a.userId.localeCompare(b.userId);
+      })
+      .slice(0, limit);
+  }
+
+  getReactorsLeaderboard(limit = 10, period = 'all_time') {
+    return this.getReactionsLeaderboard(limit, period);
+  }
+
   // Backward-compatible alias for older code paths.
-  getLeaderboard(limit = 10) {
-    return this.getWinLossLeaderboard(limit);
+  getLeaderboard(limit = 10, period = 'all_time') {
+    return this.getWinLossLeaderboard(limit, period);
   }
 
   setLastSyncNow() {
@@ -232,14 +242,45 @@ class Store {
   }
 
   stats() {
+    return this.statsForPeriod('all_time');
+  }
+
+  statsForPeriod(period = 'all_time') {
+    const playsInPeriod = new Set(
+      Object.values(this.state.plays)
+        .filter((play) => playInPeriod(play, period))
+        .map((play) => play.messageId)
+    );
+
     return {
       installedAtIso: this.state.installedAtIso,
       lastSyncIso: this.state.lastSyncIso,
-      playCount: Object.keys(this.state.plays).length,
-      reactionCount: Object.keys(this.state.reactions).length,
-      pointReactionCount: Object.keys(this.state.pointReactions).length
+      playCount: playsInPeriod.size,
+      reactionCount: Object.values(this.state.reactions).filter((reaction) => playsInPeriod.has(reaction.messageId)).length,
+      pointReactionCount: Object.values(this.state.pointReactions).filter((reaction) => playsInPeriod.has(reaction.messageId)).length
     };
   }
+}
+
+
+function normalizePeriod(period) {
+  if (period === 'weekly' || period === 'month' || period === 'monthly') return period === 'weekly' ? 'weekly' : 'monthly';
+  return period === 'all_time' ? 'all_time' : 'all_time';
+}
+
+function periodCutoffMs(period) {
+  const normalized = normalizePeriod(period);
+  const now = Date.now();
+  if (normalized === 'weekly') return now - (7 * 24 * 60 * 60 * 1000);
+  if (normalized === 'monthly') return now - (30 * 24 * 60 * 60 * 1000);
+  return null;
+}
+
+function playInPeriod(play, period = 'all_time') {
+  const cutoff = periodCutoffMs(period);
+  if (!cutoff) return true;
+  const playTime = new Date(play.createdAtIso || play.updatedAtIso || 0).getTime();
+  return Number.isFinite(playTime) && playTime >= cutoff;
 }
 
 function formatRecord(userId, wins, losses) {

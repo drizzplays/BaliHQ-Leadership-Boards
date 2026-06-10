@@ -38,7 +38,11 @@ const config = {
   // Reactors board: users get 1 point per tracked message when they use this emoji.
   reactorPointEmojis: csv(process.env.REACTOR_POINT_EMOJIS || '1445874577010851880'),
 
-  requireWebhook: bool(process.env.REQUIRE_WEBHOOK, true),
+  // If true, normal webhook messages are tracked. If BaliBot posts as a bot/app message instead of a true webhook,
+  // ALLOW_BOT_PLAY_ALERTS lets those messages count too.
+  requireWebhook: bool(process.env.REQUIRE_WEBHOOK, false),
+  allowBotPlayAlerts: bool(process.env.ALLOW_BOT_PLAY_ALERTS, true),
+  allowHumanPlayAlerts: bool(process.env.ALLOW_HUMAN_PLAY_ALERTS, false),
   trackWebhookIds: csv(process.env.TRACK_WEBHOOK_IDS),
   trackAuthorIds: csv(process.env.TRACK_AUTHOR_IDS),
 

@@ -102,12 +102,40 @@ function summarizePlayMessage(message) {
   };
 }
 
+function messageTextBlob(message) {
+  const embedText = (message.embeds || [])
+    .map((embed) => [
+      embed.title,
+      embed.description,
+      ...(embed.fields || []).flatMap((field) => [field.name, field.value])
+    ].join(' '))
+    .join(' ');
+
+  return lower([message.content, embedText].join(' '));
+}
+
+function passesPlayTextFilters(message) {
+  const textBlob = messageTextBlob(message);
+
+  if (config.embedTitleIncludes) {
+    const titles = (message.embeds || []).map((embed) => lower(embed.title)).join(' ');
+    if (!titles.includes(config.embedTitleIncludes)) return false;
+  }
+
+  if (config.messageContains) {
+    if (!textBlob.includes(config.messageContains)) return false;
+  }
+
+  return true;
+}
+
 async function shouldTrackMessage(message) {
   if (!message || !message.id || !message.guildId) return false;
   if (!config.trackChannelIds.includes(message.channelId)) return false;
   if (!isAfterStart(message)) return false;
 
-  if (config.requireWebhook && !message.webhookId) return false;
+  // Never track this leaderboard bot's own command responses.
+  if (client.user?.id && message.author?.id === client.user.id) return false;
 
   if (config.trackWebhookIds.length > 0 && !config.trackWebhookIds.includes(message.webhookId)) {
     return false;
@@ -117,18 +145,19 @@ async function shouldTrackMessage(message) {
     return false;
   }
 
-  if (config.embedTitleIncludes) {
-    const titles = (message.embeds || []).map((embed) => lower(embed.title)).join(' ');
-    if (!titles.includes(config.embedTitleIncludes)) return false;
+  if (!passesPlayTextFilters(message)) return false;
+
+  // BaliBot may post as a real webhook OR as a Discord app/bot message.
+  // Do not count random human chatter in tracked channels unless explicitly enabled.
+  const isWebhookPost = Boolean(message.webhookId);
+  const isBotOrAppPost = Boolean(message.author?.bot || message.applicationId);
+
+  if (config.requireWebhook && !isWebhookPost) {
+    if (!config.allowBotPlayAlerts || !isBotOrAppPost) return false;
   }
 
-  if (config.messageContains) {
-    const content = lower(message.content);
-    const embedText = (message.embeds || [])
-      .map((embed) => [embed.title, embed.description, ...(embed.fields || []).flatMap((f) => [f.name, f.value])].join(' '))
-      .join(' ')
-      .toLowerCase();
-    if (!content.includes(config.messageContains) && !embedText.includes(config.messageContains)) return false;
+  if (!isWebhookPost && !isBotOrAppPost && !config.allowHumanPlayAlerts) {
+    return false;
   }
 
   return true;
@@ -332,6 +361,7 @@ async function syncRecent(limit = config.syncLimit) {
 }
 
 let syncInProgress = false;
+let lastSyncResult = null;
 
 async function runRecentSync(reason = 'auto') {
   if (syncInProgress) {
@@ -342,6 +372,7 @@ async function runRecentSync(reason = 'auto') {
   syncInProgress = true;
   try {
     const result = await syncRecent(config.syncLimit);
+    lastSyncResult = { reason, atIso: new Date().toISOString(), ...result };
     console.log(`${reason} sync complete:`, result);
     return result;
   } catch (error) {
@@ -359,7 +390,6 @@ function winLossLeaderboardEmbed(limit) {
     .setDescription(rows.length ? rows.map((row, index) => {
       return `**${index + 1}.** <@${row.userId}> — **${row.wins}-${row.losses}** | **${row.winPct}%** | ${row.total} graded`;
     }).join('\n') : 'No win/loss reactions yet.')
-    .setFooter({ text: `Win emoji ID: ${config.winEmojis.join(', ')} | Loss emoji ID: ${config.lossEmojis.join(', ')}` })
     .setTimestamp(new Date());
 }
 
@@ -370,7 +400,6 @@ function reactorsLeaderboardEmbed(limit) {
     .setDescription(rows.length ? rows.map((row, index) => {
       return `**${index + 1}.** <@${row.userId}> — **${row.points}** pts`;
     }).join('\n') : 'No reactor points yet.')
-    .setFooter({ text: `Point emoji ID: ${config.reactorPointEmojis.join(', ')}` })
     .setTimestamp(new Date());
 }
 
@@ -419,7 +448,7 @@ client.on('messageCreate', async (message) => {
   try {
     if (!(await shouldTrackMessage(message))) return;
     trackMessage(message);
-    console.log(`Tracked BaliHQ webhook play: ${message.id}`);
+    console.log(`Tracked BaliHQ play alert: ${message.id}`);
   } catch (error) {
     console.error('messageCreate handler failed:', error);
   }
@@ -485,38 +514,46 @@ client.on('interactionCreate', async (interaction) => {
     if (interaction.commandName === 'leaderboard') {
       const type = interaction.options.getString('type') || 'win_loss';
       const limit = interaction.options.getInteger('limit') || 10;
-      await interaction.reply({ embeds: [leaderboardEmbed(type, limit)] });
+      await interaction.deferReply();
+      await runRecentSync('leaderboard-command');
+      await interaction.editReply({ embeds: [leaderboardEmbed(type, limit)] });
       return;
     }
 
     if (interaction.commandName === 'record') {
       const user = interaction.options.getUser('user') || interaction.user;
-      await interaction.reply({ embeds: [recordEmbed(user.id)] });
+      await interaction.deferReply({ ephemeral: true });
+      await runRecentSync('record-command');
+      await interaction.editReply({ embeds: [recordEmbed(user.id)] });
       return;
     }
 
 
     if (interaction.commandName === 'botstatus') {
+      await interaction.deferReply({ ephemeral: true });
+      await runRecentSync('botstatus-command');
       const stats = store.stats();
+      const syncLine = lastSyncResult
+        ? `Latest sync: scanned **${lastSyncResult.scanned}** messages, tracked **${lastSyncResult.tracked}** play alerts, found **${lastSyncResult.reactionWins + lastSyncResult.reactionLosses}** win/loss reactions and **${lastSyncResult.reactorPoints}** reactor points.`
+        : 'Latest sync: not available yet.';
+
       const embed = new EmbedBuilder()
         .setTitle('🏝️ BaliHQ Tracker Status')
         .setDescription([
           `Online as: <@${client.user.id}>`,
           `Tracking channels: ${config.trackChannelIds.map((id) => `<#${id}>`).join(', ')}`,
-          `Require webhook: **${config.requireWebhook}**`,
           `Tracking after: **${store.getStartIso(config.trackAfterIso)}**`,
-          `Installed at: **${stats.installedAtIso}**`,
           `Last sync: **${stats.lastSyncIso || 'never'}**`,
+          syncLine,
           `Auto sync interval: **${config.autoSyncIntervalSeconds > 0 ? `${Math.max(config.autoSyncIntervalSeconds, 30)}s` : 'off'}**`,
           `Tracked plays: **${stats.playCount}**`,
           `Stored win/loss reactions: **${stats.reactionCount}**`,
           `Stored reactor-point reactions: **${stats.pointReactionCount}**`,
-          `Win emojis: ${config.winEmojis.join(', ')}`,
-          `Loss emojis: ${config.lossEmojis.join(', ')}`,
-          `Reactor point emojis: ${config.reactorPointEmojis.join(', ')}`
-        ].join('\n'))
+          `Allowed play sources: **${config.requireWebhook ? 'webhook only, plus bot/app alerts if enabled' : 'webhook + bot/app alerts'}**`
+        ].join('
+'))
         .setTimestamp(new Date());
-      await interaction.reply({ embeds: [embed], ephemeral: true });
+      await interaction.editReply({ embeds: [embed] });
       return;
     }
   } catch (error) {

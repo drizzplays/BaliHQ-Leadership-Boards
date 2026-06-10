@@ -460,6 +460,47 @@ function cleanPct(value) {
   return number.toFixed(1).replace(/\.0$/, '');
 }
 
+function cleanDisplayName(value) {
+  const raw = String(value || '').trim() || 'Unknown User';
+  return raw
+    .replace(/[\r\n]+/g, ' ')
+    .replace(/[*_`~|>]/g, '')
+    .replace(/@everyone/g, 'everyone')
+    .replace(/@here/g, 'here')
+    .slice(0, 32);
+}
+
+const displayNameCache = new Map();
+
+async function resolveDisplayName(userId, guild = null) {
+  const cacheKey = `${guild?.id || 'global'}:${userId}`;
+  if (displayNameCache.has(cacheKey)) return displayNameCache.get(cacheKey);
+
+  let name = null;
+
+  if (guild) {
+    try {
+      const member = await guild.members.fetch(userId);
+      name = member?.displayName || member?.user?.globalName || member?.user?.username;
+    } catch (_) {
+      // Fall back to global user lookup below.
+    }
+  }
+
+  if (!name) {
+    try {
+      const user = await client.users.fetch(userId);
+      name = user?.globalName || user?.username;
+    } catch (_) {
+      name = `User ${String(userId).slice(-4)}`;
+    }
+  }
+
+  const cleaned = cleanDisplayName(name);
+  displayNameCache.set(cacheKey, cleaned);
+  return cleaned;
+}
+
 function normalizeLeaderboardType(type) {
   const normalized = String(type || 'win_loss').toLowerCase();
   if (normalized === 'reactions' || normalized === 'reactors' || normalized === 'reaction_points') return 'reactions';
@@ -504,7 +545,7 @@ function leaderboardHeader(type, period) {
   return `🏆 BaliHQ ${label} Win/Loss Leaderboard`;
 }
 
-function winLossLeaderboardEmbed(limit, period = 'all_time') {
+async function winLossLeaderboardEmbed(limit, period = 'all_time', guild = null) {
   const normalizedPeriod = normalizePeriod(period);
   const rows = store.getWinLossLeaderboard(limit, normalizedPeriod);
   const stats = store.statsForPeriod ? store.statsForPeriod(normalizedPeriod) : store.stats();
@@ -512,33 +553,28 @@ function winLossLeaderboardEmbed(limit, period = 'all_time') {
   const embed = new EmbedBuilder()
     .setColor(0x00AEEF)
     .setTitle(leaderboardHeader('win_loss', normalizedPeriod))
-    .setDescription(
-      rows.length
-        ? `BaliHQ graded play reactions • **${periodWindowText(normalizedPeriod)}**`
-        : `No win/loss grades tracked for **${periodWindowText(normalizedPeriod)}** yet.`
-    )
-    .setFooter({ text: lastUpdatedFooter(normalizedPeriod, [plural(stats.reactionCount, 'win/loss grade')]) })
+    .setFooter({ text: `BaliHQ Leaderboard • ${periodWindowText(normalizedPeriod)} • ${plural(stats.playCount, 'tracked play')} • ${plural(stats.reactionCount, 'grade')}` })
     .setTimestamp(new Date());
 
-  if (!rows.length) return embed;
-
-  for (const [index, row] of rows.entries()) {
-    const pct = cleanPct(row.winPct);
-    embed.addFields({
-      name: `${rankBadge(index)} <@${row.userId}>`,
-      value: [
-        `**Record:** ${row.wins}-${row.losses}`,
-        `**Win Rate:** ${pct}%`,
-        `**Graded Plays:** ${row.total}`
-      ].join('  •  '),
-      inline: false
-    });
+  if (!rows.length) {
+    return embed.setDescription(`No win/loss grades tracked for **${periodWindowText(normalizedPeriod)}** yet.`);
   }
 
-  return embed;
+  const lines = [];
+  for (const [index, row] of rows.entries()) {
+    const name = await resolveDisplayName(row.userId, guild);
+    const pct = cleanPct(row.winPct);
+    lines.push(`${rankBadge(index)} **${name}** — **${row.wins}-${row.losses}** · **${pct}%** · ${plural(row.total, 'grade')}`);
+  }
+
+  return embed.setDescription([
+    `BaliHQ graded play results • **${periodWindowText(normalizedPeriod)}**`,
+    '',
+    ...lines
+  ].join('\n'));
 }
 
-function reactionsLeaderboardEmbed(limit, period = 'all_time') {
+async function reactionsLeaderboardEmbed(limit, period = 'all_time', guild = null) {
   const normalizedPeriod = normalizePeriod(period);
   const rows = store.getReactionsLeaderboard
     ? store.getReactionsLeaderboard(limit, normalizedPeriod)
@@ -548,52 +584,48 @@ function reactionsLeaderboardEmbed(limit, period = 'all_time') {
   const embed = new EmbedBuilder()
     .setColor(0xFFB000)
     .setTitle(leaderboardHeader('reactions', normalizedPeriod))
-    .setDescription(
-      rows.length
-        ? `BaliHQ reaction-point emoji rankings • **${periodWindowText(normalizedPeriod)}**`
-        : `No reaction points tracked for **${periodWindowText(normalizedPeriod)}** yet.`
-    )
-    .setFooter({ text: lastUpdatedFooter(normalizedPeriod, [plural(stats.pointReactionCount, 'reaction')]) })
+    .setFooter({ text: `BaliHQ Leaderboard • ${periodWindowText(normalizedPeriod)} • ${plural(stats.playCount, 'tracked play')} • ${plural(stats.pointReactionCount, 'reaction')}` })
     .setTimestamp(new Date());
 
-  if (!rows.length) return embed;
-
-  for (const [index, row] of rows.entries()) {
-    const reactions = Number(row.reactions ?? row.points ?? 0);
-    embed.addFields({
-      name: `${rankBadge(index)} <@${row.userId}>`,
-      value: `**${plural(reactions, 'reaction')}**`,
-      inline: false
-    });
+  if (!rows.length) {
+    return embed.setDescription(`No reaction points tracked for **${periodWindowText(normalizedPeriod)}** yet.`);
   }
 
-  return embed;
+  const lines = [];
+  for (const [index, row] of rows.entries()) {
+    const name = await resolveDisplayName(row.userId, guild);
+    const reactions = Number(row.reactions ?? row.points ?? 0);
+    lines.push(`${rankBadge(index)} **${name}** — **${plural(reactions, 'reaction')}**`);
+  }
+
+  return embed.setDescription([
+    `BaliHQ reaction leaderboard • **${periodWindowText(normalizedPeriod)}**`,
+    '',
+    ...lines
+  ].join('\n'));
 }
 
-function leaderboardEmbed(type, limit, period = 'all_time') {
+async function leaderboardEmbed(type, limit, period = 'all_time', guild = null) {
   const normalizedType = normalizeLeaderboardType(type);
-  if (normalizedType === 'reactions') return reactionsLeaderboardEmbed(limit, period);
-  return winLossLeaderboardEmbed(limit, period);
+  if (normalizedType === 'reactions') return reactionsLeaderboardEmbed(limit, period, guild);
+  return winLossLeaderboardEmbed(limit, period, guild);
 }
 
-function recordEmbed(userId, period = 'all_time') {
+async function recordEmbed(userId, period = 'all_time', guild = null) {
   const normalizedPeriod = normalizePeriod(period);
   const row = store.getUserRecord(userId, normalizedPeriod);
   const reactionRow = store.getUserPoints(userId, normalizedPeriod);
   const pct = cleanPct(row.winPct);
+  const name = await resolveDisplayName(userId, guild);
 
   return new EmbedBuilder()
     .setColor(0x00AEEF)
     .setTitle(`📌 BaliHQ ${periodLabel(normalizedPeriod)} Member Record`)
-    .setDescription(`<@${row.userId}> • **${periodWindowText(normalizedPeriod)}**`)
+    .setDescription(`**${name}** • ${periodWindowText(normalizedPeriod)}`)
     .addFields(
       {
         name: 'Win/Loss',
-        value: [
-          `**Record:** ${row.wins}-${row.losses}`,
-          `**Win Rate:** ${pct}%`,
-          `**Graded Plays:** ${row.total}`
-        ].join('  •  '),
+        value: `**${row.wins}-${row.losses}** · **${pct}%** · ${plural(row.total, 'grade')}`,
         inline: false
       },
       {
@@ -702,7 +734,7 @@ client.on('interactionCreate', async (interaction) => {
       const limit = interaction.options.getInteger('limit') || 10;
       await interaction.deferReply();
       await runRecentSync('leaderboard-command');
-      await interaction.editReply({ embeds: [leaderboardEmbed(type, limit, period)] });
+      await interaction.editReply({ embeds: [await leaderboardEmbed(type, limit, period, interaction.guild)] });
       return;
     }
 
@@ -711,7 +743,7 @@ client.on('interactionCreate', async (interaction) => {
       const period = interaction.options.getString('period') || 'all_time';
       await interaction.deferReply({ flags: MessageFlags.Ephemeral });
       await runRecentSync('record-command');
-      await interaction.editReply({ embeds: [recordEmbed(user.id, period)] });
+      await interaction.editReply({ embeds: [await recordEmbed(user.id, period, interaction.guild)] });
       return;
     }
 

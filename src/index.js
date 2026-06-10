@@ -10,9 +10,9 @@ const {
 const { config } = require('./config');
 const { Store } = require('./store');
 
-let createCanvas = null;
+let sharp = null;
 try {
-  ({ createCanvas } = require('@napi-rs/canvas'));
+  sharp = require('sharp');
 } catch (error) {
   console.warn('Leaderboard image renderer unavailable:', error.message);
 }
@@ -510,126 +510,58 @@ async function resolveDisplayName(userId, guild = null) {
 }
 
 
+
 function escapeHtml(value) {
   return String(value || '')
     .replace(/&/g, '&amp;')
     .replace(/</g, '&lt;')
     .replace(/>/g, '&gt;')
-    .replace(/"/g, '&quot;');
+    .replace(/"/g, '&quot;')
+    .replace(/'/g, '&#39;');
 }
 
-function trimText(ctx, text, maxWidth) {
-  const value = String(text || '');
-  if (ctx.measureText(value).width <= maxWidth) return value;
-  let trimmed = value;
-  while (trimmed.length > 1 && ctx.measureText(`${trimmed}…`).width > maxWidth) {
-    trimmed = trimmed.slice(0, -1);
-  }
-  return `${trimmed}…`;
+function trimPlainText(value, maxLength = 24) {
+  const raw = String(value || '').replace(/[\r\n]+/g, ' ').trim();
+  if (raw.length <= maxLength) return raw;
+  return `${raw.slice(0, Math.max(0, maxLength - 1))}…`;
 }
 
-function roundedRect(ctx, x, y, width, height, radius, fillStyle, strokeStyle = null, lineWidth = 1) {
-  const r = Math.min(radius, width / 2, height / 2);
-  ctx.beginPath();
-  ctx.moveTo(x + r, y);
-  ctx.arcTo(x + width, y, x + width, y + height, r);
-  ctx.arcTo(x + width, y + height, x, y + height, r);
-  ctx.arcTo(x, y + height, x, y, r);
-  ctx.arcTo(x, y, x + width, y, r);
-  ctx.closePath();
-  if (fillStyle) {
-    ctx.fillStyle = fillStyle;
-    ctx.fill();
-  }
-  if (strokeStyle) {
-    ctx.strokeStyle = strokeStyle;
-    ctx.lineWidth = lineWidth;
-    ctx.stroke();
-  }
+function rankMedal(rank) {
+  if (rank === 1) return '1';
+  if (rank === 2) return '2';
+  if (rank === 3) return '3';
+  return String(rank);
 }
 
-function drawPill(ctx, x, y, text, fill, textColor) {
-  ctx.font = '600 24px sans-serif';
-  const paddingX = 18;
-  const height = 40;
-  const width = ctx.measureText(text).width + paddingX * 2;
-  roundedRect(ctx, x, y, width, height, 20, fill, null, 0);
-  ctx.fillStyle = textColor;
-  ctx.textAlign = 'left';
-  ctx.textBaseline = 'middle';
-  ctx.fillText(text, x + paddingX, y + height / 2 + 1);
-  return width;
+function medalFill(rank) {
+  if (rank === 1) return '#F7C948';
+  if (rank === 2) return '#AEB7C8';
+  if (rank === 3) return '#C47A39';
+  return '#263248';
 }
 
-function drawRowCard(ctx, x, y, width, height, row, palette, type) {
-  const topThreeFills = ['rgba(246, 194, 62, 0.18)', 'rgba(173, 181, 189, 0.16)', 'rgba(205, 127, 50, 0.16)'];
-  const topThreeStrokes = ['rgba(246, 194, 62, 0.45)', 'rgba(173, 181, 189, 0.38)', 'rgba(205, 127, 50, 0.36)'];
-  const isTopThree = row.rank <= 3;
-  roundedRect(
-    ctx,
-    x,
-    y,
-    width,
-    height,
-    26,
-    isTopThree ? topThreeFills[row.rank - 1] : 'rgba(255,255,255,0.035)',
-    isTopThree ? topThreeStrokes[row.rank - 1] : 'rgba(255,255,255,0.08)',
-    1.5
-  );
+function rowStroke(rank) {
+  if (rank === 1) return '#F7C948';
+  if (rank === 2) return '#AEB7C8';
+  if (rank === 3) return '#C47A39';
+  return '#2A364E';
+}
 
-  const medal = row.rank === 1 ? '🥇' : row.rank === 2 ? '🥈' : row.rank === 3 ? '🥉' : `${row.rank}.`;
-  ctx.textBaseline = 'middle';
-  ctx.textAlign = 'left';
-
-  ctx.font = row.rank <= 3 ? '700 34px sans-serif' : '700 30px sans-serif';
-  ctx.fillStyle = isTopThree ? '#FFFFFF' : '#E7EBF4';
-  ctx.fillText(medal, x + 26, y + height / 2);
-
-  const leftStart = x + 96;
-  const metricBlockWidth = type === 'reactions' ? 170 : 410;
-  const nameWidth = width - (leftStart - x) - metricBlockWidth - 30;
-  const safeName = trimText(ctx, row.name, nameWidth);
-
-  ctx.font = '700 30px sans-serif';
-  ctx.fillStyle = '#FFFFFF';
-  ctx.fillText(safeName, leftStart, y + 33);
-
-  ctx.font = '500 20px sans-serif';
-  ctx.fillStyle = '#98A3B8';
-  ctx.fillText(type === 'reactions' ? 'Reaction leaderboard' : 'Graded play results', leftStart, y + 66);
-
-  ctx.textAlign = 'right';
-  if (type === 'reactions') {
-    ctx.font = '800 32px sans-serif';
-    ctx.fillStyle = '#FFFFFF';
-    ctx.fillText(String(row.reactions), x + width - 26, y + 31);
-
-    ctx.font = '600 20px sans-serif';
-    ctx.fillStyle = '#AAB5C8';
-    ctx.fillText(row.reactions === 1 ? 'reaction' : 'reactions', x + width - 26, y + 64);
-  } else {
-    ctx.font = '800 30px sans-serif';
-    ctx.fillStyle = '#FFFFFF';
-    ctx.fillText(`${row.wins}-${row.losses}`, x + width - 26, y + 26);
-
-    ctx.font = '600 18px sans-serif';
-    ctx.fillStyle = '#AAB5C8';
-    ctx.fillText(`${cleanPct(row.winPct)}% win rate`, x + width - 26, y + 50);
-    ctx.fillText(`${row.total} ${row.total === 1 ? 'grade' : 'grades'}`, x + width - 26, y + 72);
-  }
+function safeSvgText(value) {
+  return escapeHtml(String(value || '').replace(/[\u0000-\u001F\u007F]/g, ''));
 }
 
 async function renderLeaderboardImage({ type, period, rows, stats, guild }) {
-  if (!createCanvas) return null;
+  if (!sharp) return null;
 
   const normalizedType = normalizeLeaderboardType(type);
   const normalizedPeriod = normalizePeriod(period);
-  const accent = normalizedType === 'reactions' ? '#FFB020' : '#12A9FF';
-  const headerEmoji = normalizedType === 'reactions' ? '⚡' : '🏆';
-  const title = `${headerEmoji} BaliHQ ${periodLabel(normalizedPeriod)} ${normalizedType === 'reactions' ? 'Reactions' : 'Win/Loss'} Leaderboard`;
-  const subtitle = normalizedType === 'reactions'
-    ? `Reaction leaderboard • ${periodWindowText(normalizedPeriod)}`
-    : `Graded play results • ${periodWindowText(normalizedPeriod)}`;
+  const isReactions = normalizedType === 'reactions';
+  const accent = isReactions ? '#FFB020' : '#12A9FF';
+  const accentDark = isReactions ? '#5C3900' : '#003D5C';
+  const titleIcon = isReactions ? '⚡' : '🏆';
+  const title = `BaliHQ ${periodLabel(normalizedPeriod)} ${isReactions ? 'Reactions' : 'Win/Loss'} Leaderboard`;
+  const subtitle = `${isReactions ? 'Reaction leaderboard' : 'Graded play results'} • ${periodWindowText(normalizedPeriod)}`;
 
   const resolvedRows = [];
   for (const [index, row] of rows.entries()) {
@@ -641,83 +573,88 @@ async function renderLeaderboardImage({ type, period, rows, stats, guild }) {
   }
 
   const visibleRows = resolvedRows.slice(0, 10);
-  const rowHeight = 92;
-  const height = 260 + Math.max(visibleRows.length, 1) * (rowHeight + 16) + 120;
+  const rowHeight = 96;
+  const gap = 16;
+  const rowsHeight = visibleRows.length ? (visibleRows.length * rowHeight) + ((visibleRows.length - 1) * gap) : 170;
   const width = 1200;
-  const canvas = createCanvas(width, height);
-  const ctx = canvas.getContext('2d');
+  const height = 300 + rowsHeight + 118;
+  const cardX = 64;
+  const cardW = width - (cardX * 2);
 
-  const grad = ctx.createLinearGradient(0, 0, width, height);
-  grad.addColorStop(0, '#0A1020');
-  grad.addColorStop(0.55, '#0B1222');
-  grad.addColorStop(1, '#070B14');
-  ctx.fillStyle = grad;
-  ctx.fillRect(0, 0, width, height);
-
-  // glow accent
-  ctx.save();
-  ctx.globalAlpha = 0.16;
-  ctx.fillStyle = accent;
-  ctx.beginPath();
-  ctx.arc(width - 120, 120, 180, 0, Math.PI * 2);
-  ctx.fill();
-  ctx.restore();
-
-  roundedRect(ctx, 28, 28, width - 56, height - 56, 32, 'rgba(255,255,255,0.025)', 'rgba(255,255,255,0.07)', 1.2);
-  ctx.fillStyle = accent;
-  roundedRect(ctx, 28, 28, 8, height - 56, 4, accent);
-
-  ctx.textAlign = 'left';
-  ctx.textBaseline = 'top';
-  ctx.fillStyle = '#F8FAFC';
-  ctx.font = '800 44px sans-serif';
-  ctx.fillText(title, 72, 56);
-
-  ctx.fillStyle = '#B7C2D9';
-  ctx.font = '500 26px sans-serif';
-  ctx.fillText(subtitle, 72, 112);
-
-  let pillX = 72;
-  pillX += drawPill(ctx, pillX, 156, periodWindowText(normalizedPeriod), 'rgba(255,255,255,0.08)', '#EAF1FF') + 12;
-  pillX += drawPill(ctx, pillX, 156, `${stats.playCount} ${stats.playCount === 1 ? 'tracked play' : 'tracked plays'}`, 'rgba(255,255,255,0.08)', '#EAF1FF') + 12;
-  const lastMetric = normalizedType === 'reactions'
+  const metricText = isReactions
     ? `${stats.pointReactionCount} ${stats.pointReactionCount === 1 ? 'reaction' : 'reactions'}`
     : `${stats.reactionCount} ${stats.reactionCount === 1 ? 'grade' : 'grades'}`;
-  drawPill(ctx, pillX, 156, lastMetric, 'rgba(255,255,255,0.08)', '#EAF1FF');
 
-  const contentY = 228;
+  const rowsSvg = visibleRows.length
+    ? visibleRows.map((row, idx) => {
+        const y = 230 + idx * (rowHeight + gap);
+        const name = safeSvgText(trimPlainText(row.name, 28));
+        const rank = row.rank;
+        const badgeFill = medalFill(rank);
+        const stroke = rowStroke(rank);
+        const resultLine = isReactions
+          ? `${Number(row.reactions ?? row.points ?? 0)} ${Number(row.reactions ?? row.points ?? 0) === 1 ? 'reaction' : 'reactions'}`
+          : `${row.wins}-${row.losses} • ${cleanPct(row.winPct)}% • ${row.total} ${row.total === 1 ? 'grade' : 'grades'}`;
+        const rightBig = isReactions ? String(Number(row.reactions ?? row.points ?? 0)) : `${row.wins}-${row.losses}`;
+        const rightSmall = isReactions ? (Number(row.reactions ?? row.points ?? 0) === 1 ? 'reaction' : 'reactions') : `${cleanPct(row.winPct)}% win rate`;
+        return `
+          <rect x="${cardX}" y="${y}" width="${cardW}" height="${rowHeight}" rx="26" fill="rgba(255,255,255,0.045)" stroke="${stroke}" stroke-opacity="0.55"/>
+          <circle cx="112" cy="${y + 48}" r="28" fill="${badgeFill}"/>
+          <text x="112" y="${y + 58}" text-anchor="middle" font-family="Arial, Helvetica, sans-serif" font-size="28" font-weight="900" fill="#0B1020">${rankMedal(rank)}</text>
+          <text x="160" y="${y + 41}" font-family="Arial, Helvetica, sans-serif" font-size="31" font-weight="800" fill="#FFFFFF">${name}</text>
+          <text x="160" y="${y + 73}" font-family="Arial, Helvetica, sans-serif" font-size="22" font-weight="600" fill="#AAB5C8">${safeSvgText(resultLine)}</text>
+          <text x="${width - 92}" y="${y + 39}" text-anchor="end" font-family="Arial, Helvetica, sans-serif" font-size="32" font-weight="900" fill="#FFFFFF">${safeSvgText(rightBig)}</text>
+          <text x="${width - 92}" y="${y + 70}" text-anchor="end" font-family="Arial, Helvetica, sans-serif" font-size="20" font-weight="700" fill="#AAB5C8">${safeSvgText(rightSmall)}</text>
+        `;
+      }).join('')
+    : `
+      <rect x="${cardX}" y="230" width="${cardW}" height="170" rx="28" fill="rgba(255,255,255,0.045)" stroke="rgba(255,255,255,0.10)"/>
+      <text x="${width / 2}" y="302" text-anchor="middle" font-family="Arial, Helvetica, sans-serif" font-size="36" font-weight="900" fill="#FFFFFF">No tracked data yet</text>
+      <text x="${width / 2}" y="346" text-anchor="middle" font-family="Arial, Helvetica, sans-serif" font-size="23" font-weight="600" fill="#AAB5C8">New tracked plays and reactions will populate this board.</text>
+    `;
 
-  if (!visibleRows.length) {
-    roundedRect(ctx, 72, contentY, width - 144, 170, 30, 'rgba(255,255,255,0.035)', 'rgba(255,255,255,0.08)', 1);
-    ctx.textAlign = 'center';
-    ctx.textBaseline = 'middle';
-    ctx.fillStyle = '#FFFFFF';
-    ctx.font = '800 34px sans-serif';
-    ctx.fillText('No tracked data yet', width / 2, contentY + 62);
-    ctx.fillStyle = '#AAB5C8';
-    ctx.font = '500 22px sans-serif';
-    ctx.fillText(`Run more tracked plays to populate the ${normalizedType === 'reactions' ? 'reactions' : 'win/loss'} board.`, width / 2, contentY + 108);
-  } else {
-    let y = contentY;
-    for (const row of visibleRows) {
-      drawRowCard(ctx, 72, y, width - 144, rowHeight, row, { accent }, normalizedType);
-      y += rowHeight + 16;
-    }
-  }
+  const footerY = height - 70;
+  const svg = `
+  <svg xmlns="http://www.w3.org/2000/svg" width="${width}" height="${height}" viewBox="0 0 ${width} ${height}">
+    <defs>
+      <linearGradient id="bg" x1="0" y1="0" x2="1" y2="1">
+        <stop offset="0" stop-color="#080E1C"/>
+        <stop offset="0.55" stop-color="#0B1222"/>
+        <stop offset="1" stop-color="#060A13"/>
+      </linearGradient>
+      <radialGradient id="glow" cx="88%" cy="12%" r="45%">
+        <stop offset="0" stop-color="${accent}" stop-opacity="0.26"/>
+        <stop offset="1" stop-color="${accent}" stop-opacity="0"/>
+      </radialGradient>
+      <filter id="shadow" x="-20%" y="-20%" width="140%" height="140%">
+        <feDropShadow dx="0" dy="16" stdDeviation="18" flood-color="#000000" flood-opacity="0.35"/>
+      </filter>
+    </defs>
 
-  ctx.textAlign = 'left';
-  ctx.textBaseline = 'alphabetic';
-  ctx.fillStyle = '#8C97AC';
-  ctx.font = '500 20px sans-serif';
-  const footerText = `Updated ${formatDateTime(new Date().toISOString())} • BaliHQ Leaderboard`;
-  ctx.fillText(footerText, 72, height - 74);
+    <rect width="${width}" height="${height}" fill="url(#bg)"/>
+    <rect width="${width}" height="${height}" fill="url(#glow)"/>
+    <rect x="28" y="28" width="${width - 56}" height="${height - 56}" rx="34" fill="rgba(255,255,255,0.025)" stroke="rgba(255,255,255,0.08)" filter="url(#shadow)"/>
+    <rect x="28" y="28" width="8" height="${height - 56}" rx="4" fill="${accent}"/>
 
-  if (resolvedRows.length > visibleRows.length) {
-    ctx.textAlign = 'right';
-    ctx.fillText(`Showing top ${visibleRows.length} of ${resolvedRows.length}`, width - 72, height - 74);
-  }
+    <circle cx="96" cy="82" r="42" fill="${accentDark}" stroke="${accent}" stroke-width="2"/>
+    <text x="96" y="98" text-anchor="middle" font-family="Arial, Helvetica, sans-serif" font-size="38" font-weight="900" fill="#FFFFFF">${titleIcon}</text>
+    <text x="154" y="78" font-family="Arial, Helvetica, sans-serif" font-size="44" font-weight="900" fill="#F8FAFC">${safeSvgText(title)}</text>
+    <text x="154" y="122" font-family="Arial, Helvetica, sans-serif" font-size="25" font-weight="600" fill="#B7C2D9">${safeSvgText(subtitle)}</text>
 
-  const buffer = await canvas.encode('png');
+    <rect x="64" y="160" width="300" height="42" rx="21" fill="rgba(255,255,255,0.075)"/>
+    <text x="84" y="188" font-family="Arial, Helvetica, sans-serif" font-size="22" font-weight="800" fill="#EAF1FF">${safeSvgText(periodWindowText(normalizedPeriod))}</text>
+    <rect x="380" y="160" width="260" height="42" rx="21" fill="rgba(255,255,255,0.075)"/>
+    <text x="400" y="188" font-family="Arial, Helvetica, sans-serif" font-size="22" font-weight="800" fill="#EAF1FF">${stats.playCount} ${stats.playCount === 1 ? 'tracked play' : 'tracked plays'}</text>
+    <rect x="656" y="160" width="230" height="42" rx="21" fill="rgba(255,255,255,0.075)"/>
+    <text x="676" y="188" font-family="Arial, Helvetica, sans-serif" font-size="22" font-weight="800" fill="#EAF1FF">${safeSvgText(metricText)}</text>
+
+    ${rowsSvg}
+
+    <text x="64" y="${footerY}" font-family="Arial, Helvetica, sans-serif" font-size="21" font-weight="600" fill="#8C97AC">Updated ${safeSvgText(formatDateTime(new Date().toISOString()))} • BaliHQ Leaderboard</text>
+    ${resolvedRows.length > visibleRows.length ? `<text x="${width - 64}" y="${footerY}" text-anchor="end" font-family="Arial, Helvetica, sans-serif" font-size="21" font-weight="600" fill="#8C97AC">Showing top ${visibleRows.length} of ${resolvedRows.length}</text>` : ''}
+  </svg>`;
+
+  const buffer = await sharp(Buffer.from(svg)).png().toBuffer();
   const fileName = `balihq-${normalizedType}-${normalizedPeriod}-leaderboard.png`;
   return new AttachmentBuilder(buffer, { name: fileName });
 }
@@ -730,15 +667,20 @@ async function leaderboardImageReply(type, limit, period = 'all_time', guild = n
     ? (store.getReactionsLeaderboard ? store.getReactionsLeaderboard(limit, normalizedPeriod) : store.getReactorsLeaderboard(limit, normalizedPeriod))
     : store.getWinLossLeaderboard(limit, normalizedPeriod);
 
-  const attachment = await renderLeaderboardImage({
-    type: normalizedType,
-    period: normalizedPeriod,
-    rows,
-    stats,
-    guild
-  });
+  try {
+    const attachment = await renderLeaderboardImage({
+      type: normalizedType,
+      period: normalizedPeriod,
+      rows,
+      stats,
+      guild
+    });
 
-  return { attachment, rows, stats };
+    return { attachment, rows, stats, error: null };
+  } catch (error) {
+    console.error('Image leaderboard render failed:', error);
+    return { attachment: null, rows, stats, error };
+  }
 }
 
 function normalizeLeaderboardType(type) {
@@ -975,11 +917,14 @@ client.on('interactionCreate', async (interaction) => {
       await interaction.deferReply();
       await runRecentSync('leaderboard-command');
 
-      const { attachment } = await leaderboardImageReply(type, limit, period, interaction.guild);
+      const { attachment, error } = await leaderboardImageReply(type, limit, period, interaction.guild);
       if (attachment) {
         await interaction.editReply({ files: [attachment] });
       } else {
-        await interaction.editReply({ embeds: [await leaderboardEmbed(type, limit, period, interaction.guild)] });
+        await interaction.editReply({
+          content: error ? `Image leaderboard failed to render: ${error.message}` : 'Image leaderboard renderer is unavailable. Showing fallback embed.',
+          embeds: [await leaderboardEmbed(type, limit, period, interaction.guild)]
+        });
       }
       return;
     }
